@@ -1,0 +1,47 @@
+# Python standard ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+env/
+venv/
+.venv/
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project Data (heavy files/images)
+data/*
+!data/test_subset_1000.json
+!data/imagenet_full/
+data/imagenet_full/*
+!data/imagenet_full/cluster_centers.npy
+!data/imagenet_full/class_weights.npy
+imagenet-object-localization-challenge/
+imagenetto_a/
+img_test/
+
+# Project Outputs & Logs
+logs/
+checkpoints/
+results/
+evaluation_results/
+
+# Specific output files in root
+debug_overfit_result.png
+debug_overfit_result_v3.png
+visual_comparison.png
+tests_result.xlsx
+final_metrics.json
+
+# Mac OS
+.DS_Store
