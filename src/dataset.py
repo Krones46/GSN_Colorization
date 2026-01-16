@@ -3,7 +3,7 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
-from skimage import transform
+import cv2
 
 from configs.config import PROCESSED_DIR, TRAIN_NUM_SHARDS
 from src.color_utils import ColorEncoder
@@ -19,12 +19,11 @@ class ColorizationIterableDataset(IterableDataset):
     """
 
     def __init__(self, processed_dir: str = PROCESSED_DIR,
-                 split: str = "train", train_split: float = 0.9):
+                 split: str = "train", train_split: float = 0.9, limit_shards: int = None):
         super().__init__()
         self.processed_dir = processed_dir
         self.split = split
         self.train_split = train_split
-        self.encoder = ColorEncoder()
 
         index_path = os.path.join(processed_dir, "index.json")
         if not os.path.exists(index_path):
@@ -48,18 +47,32 @@ class ColorizationIterableDataset(IterableDataset):
 
         if split == "train":
             available_shards = all_shard_names[:split_point]
-            if TRAIN_NUM_SHARDS is not None:
-                limit = min(TRAIN_NUM_SHARDS, len(available_shards))
+            # Priority: limit_shards arg > TRAIN_NUM_SHARDS config
+            limit = None
+            if limit_shards is not None:
+                limit = limit_shards
+            elif TRAIN_NUM_SHARDS is not None:
+                limit = TRAIN_NUM_SHARDS
+            
+            if limit is not None:
+                limit = min(limit, len(available_shards))
                 self.shard_names = available_shards[:limit]
             else:
                 self.shard_names = available_shards
         else:
             self.shard_names = all_shard_names[split_point:]
+            # Limit validation set size if requested
+            if limit_shards is not None:
+                limit = min(limit_shards, len(self.shard_names))
+                self.shard_names = self.shard_names[:limit]
 
         print(f"[{split}] Initialized IterableDataset with {len(self.shard_names)} shards")
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
+        
+        # Disable OpenCV multithreading in workers to prevent CPU overload on Windows
+        cv2.setNumThreads(0)
         
         # Copy list to avoid modifying original in self
         shards = self.shard_names.copy()
@@ -103,17 +116,13 @@ class ColorizationIterableDataset(IterableDataset):
                     L_tensor = torch.from_numpy(L_img).float()
                     
                     # Half resolution (112x112)
-                    ab_resized = transform.resize(ab_img, (112, 112), anti_aliasing=True)
+                    # Use cv2 for speed (ab_img is HxWx2)
+                    ab_resized = cv2.resize(ab_img, (112, 112), interpolation=cv2.INTER_LINEAR)
                     
-                    # Flatten and Encode
-                    ab_flat = ab_resized.reshape(-1, 2)
-                    soft_encoded = self.encoder.encode_points_to_soft(ab_flat)
+                    # Tensor (2, 112, 112)
+                    ab_tensor = torch.from_numpy(ab_resized).float().permute(2, 0, 1)
                     
-                    # Reshape to tensor (313, 112, 112)
-                    soft_tensor = torch.from_numpy(soft_encoded).float()
-                    soft_tensor = soft_tensor.transpose(0, 1).reshape(313, 112, 112)
-                    
-                    yield L_tensor, soft_tensor
+                    yield L_tensor, ab_tensor
 
             except Exception as e:
                 print(f"Error loading shard {shard_path}: {e}")

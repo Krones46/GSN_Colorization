@@ -22,6 +22,51 @@ def get_cluster_centers():
         raise FileNotFoundError(f"Missing {CLUSTER_CENTERS_PATH}")
     return np.load(CLUSTER_CENTERS_PATH)
 
+def encode_batch_torch(ab_tensor, centers_tensor, sigma=5.0):
+    """
+    GPU optimized soft encoding.
+    ab_tensor: (B, 2, H, W) or (B, H, W, 2)
+    centers_tensor: (313, 2)
+    Returns: (B, 313, H, W)
+    """
+    # Standardize input to (B, H, W, 2)
+    if ab_tensor.shape[1] == 2 and ab_tensor.ndim == 4:
+        ab = ab_tensor.permute(0, 2, 3, 1) # (B, H, W, 2)
+    else:
+        ab = ab_tensor
+        
+    B, H, W, C = ab.shape
+    Q, _ = centers_tensor.shape
+    
+    # Flatten: (B*H*W, 2)
+    ab_flat = ab.reshape(-1, 2)
+    
+    # Calculate Distances efficiently
+    # dist^2 = x^2 + c^2 - 2xc
+    # Note: For large batches/resolutions, this may consume significant VRAM.
+    
+    dists_sq = torch.cdist(ab_flat, centers_tensor, p=2.0).pow(2) # (N, 313)
+    
+    # Find 5 nearest neighbors
+    # topk returns largest, so we neg dists
+    topk_vals, topk_indices = torch.topk(-dists_sq, k=5, dim=1) # (N, 5)
+    
+    # Recalculate true squared distances for weights
+    nearest_dists_sq = -topk_vals
+    
+    # Weights
+    wts = torch.exp(-nearest_dists_sq / (2 * sigma**2))
+    wts = wts / torch.sum(wts, dim=1, keepdim=True) # Normalize
+    
+    # Scatter back to (N, 313)
+    # Create empty (N, 313)
+    soft_flat = torch.zeros(ab_flat.size(0), Q, device=ab.device, dtype=ab.dtype)
+    soft_flat.scatter_(1, topk_indices, wts)
+    
+    # Reshape back to (B, H, W, 313) -> (B, 313, H, W)
+    soft = soft_flat.view(B, H, W, Q).permute(0, 3, 1, 2)
+    return soft
+
 class ColorEncoder:
     def __init__(self, sigma=5.0):
         self.sigma = sigma

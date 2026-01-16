@@ -45,3 +45,16 @@ final_metrics.json
 
 # Mac OS
 .DS_Store
+
+# Hydra & Lightning
+outputs/
+lightning_logs/
+wandb/
+.hydra/
+
+# User ignored
+test_images/
+scripts/evaluate_folder.py
+scripts/evaluate_metrics.py
+scripts/generate_group_report.py
+enhanced_report.html

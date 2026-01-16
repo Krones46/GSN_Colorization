@@ -1,0 +1,22 @@
+defaults:
+  - _self_
+
+experiment_name: "colorization_resnet34"
+
+data:
+  batch_size: 64
+  num_workers: 4
+  split_ratio: 0.9
+  limit_shards: null # Train on full dataset
+
+model:
+  lr: 0.001
+  weight_decay: 0.0001
+  class_weights_path: "data/imagenet_full/class_weights.npy"
+
+trainer:
+  max_epochs: 10
+  accelerator: "auto" 
+  devices: 1
+  precision: "16-mixed"
+  log_every_n_steps: 10

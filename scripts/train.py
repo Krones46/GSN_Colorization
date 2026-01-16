@@ -1,230 +1,109 @@
 import sys
 import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import numpy as np
-
-"""
-Main training script for the colorization model.
-Handles training loop, validation, checkpointing, and mixed precision training.
-"""
+import hydra
+from omegaconf import DictConfig
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from configs.config import (
-    BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
-    NUM_WORKERS, USE_AMP, DEVICE, CHECKPOINTS_DIR,  LOG_DIR,
-    CLASS_WEIGHTS_PATH, RESUME_FROM
-)
-
-from src.model import ColorizationModel
+from src.lightning_module import ColorizationLightningModule
 from src.dataset import ColorizationIterableDataset
+from configs.config import PROCESSED_DIR, CLASS_WEIGHTS_PATH, TRAIN_NUM_SHARDS
 
-class AverageMeter:
-    # Average meter class.
-    def __init__(self):
-        self.reset()
-    def reset(self):
-        self.val, self.avg, self.sum, self.count = 0, 0, 0, 0
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        if self.count > 0: self.avg = self.sum / self.count
-
-def validate(model, loader, criterion):
-    # Validation function.
-    model.eval() 
-    loss_meter = AverageMeter()
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: DictConfig):
+    pl.seed_everything(42)
     
-    from configs.config import TRAIN_NUM_SHARDS
+    # Optimize for Tensor Cores
+    torch.set_float32_matmul_precision('medium')
     
-    pbar = tqdm(loader, desc="Validating", leave=False)
+    # 1. DataPaths
+    data_dir = cfg.data.get("processed_dir", PROCESSED_DIR)
+    if not os.path.isabs(data_dir) and not os.path.exists(data_dir):
+        # Fallback to config if relative path fails (Hydra changes cwd)
+        import hydra.utils
+        data_dir = os.path.join(hydra.utils.get_original_cwd(), data_dir)
+
+    print(f"Data Dir: {data_dir}")
     
-    with torch.no_grad(): 
-        for i, (L, targets) in enumerate(pbar):
-            if TRAIN_NUM_SHARDS is not None and TRAIN_NUM_SHARDS < 500 and i > 300:
-                break
-
-            L = L.to(DEVICE, non_blocking=True)
-            targets = targets.to(DEVICE, non_blocking=True)
-            
-            # Upsample on GPU
-            if targets.shape[-1] != 112:
-                targets = F.interpolate(targets, size=(112, 112), mode='nearest')
-            
-            logits = model(L)
-            loss = criterion(logits, targets)
-            loss_meter.update(loss.item(), L.size(0))
-            
-    return loss_meter.avg
-
-def train():
-    # 1. Setup
-    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-    os.makedirs(LOG_DIR, exist_ok=True)
+    # 2. Datasets & Loaders
+    limit_shards = cfg.data.get("limit_shards", TRAIN_NUM_SHARDS)
     
-    if DEVICE == "cuda":
-        torch.backends.cudnn.benchmark = True
-
-    print(f"Device: {DEVICE}")
-    print(f"Batch Size: {BATCH_SIZE}")
-    print(f"AMP: {USE_AMP}")
-
-    # 2. Data
-    print("Initializing Datasets")
-    train_dataset = ColorizationIterableDataset(split="train")
-    val_dataset = ColorizationIterableDataset(split="val") 
+    if limit_shards is None:
+        print("INFO: Training on FULL dataset (limit_shards=None).")
+    else:
+        print(f"INFO: Limiting dataset to {limit_shards} shards.")
     
-    train_loader = DataLoader(
+    train_dataset = ColorizationIterableDataset(
+        processed_dir=data_dir, 
+        split="train", 
+        train_split=cfg.data.split_ratio,
+        limit_shards=limit_shards
+    )
+    val_dataset = ColorizationIterableDataset(
+        processed_dir=data_dir, 
+        split="val", 
+        train_split=cfg.data.split_ratio,
+        limit_shards=limit_shards
+    )
+
+    # Determine persistent_workers based on num_workers
+    use_persistent_workers = (cfg.data.num_workers > 0)
+
+    train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        pin_memory=False,
-        prefetch_factor=2 if NUM_WORKERS > 0 else None,
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        pin_memory=True,
+        persistent_workers=use_persistent_workers,
     )
     
-    val_loader = DataLoader(
+    val_loader = torch.utils.data.DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=max(1, NUM_WORKERS // 2), 
-        pin_memory=False,
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        pin_memory=True,
+        persistent_workers=use_persistent_workers,
     )
 
     # 3. Model
-    model = ColorizationModel().to(DEVICE)
+    # Helper to resolve weight path
+    cw_path = cfg.model.get("class_weights_path", CLASS_WEIGHTS_PATH)
+    if not os.path.isabs(cw_path) and not os.path.exists(cw_path):
+        import hydra.utils
+        cw_path = os.path.join(hydra.utils.get_original_cwd(), cw_path)
 
-    # 4. Loss
-    if os.path.exists(CLASS_WEIGHTS_PATH):
-        print(f"Loading class weights from {CLASS_WEIGHTS_PATH}")
-        weights = np.load(CLASS_WEIGHTS_PATH)
-        weights = torch.from_numpy(weights).float().to(DEVICE)
-    else:
-        print("Class weights not found")
-        weights = torch.ones(NUM_COLOR_CLASSES).to(DEVICE)
-
-    class MultinomialCrossEntropyLoss(nn.Module):
-        def __init__(self, weights=None):
-            super().__init__()
-            self.weights = weights
-            
-        def forward(self, logits, targets):
-            log_probs = F.log_softmax(logits, dim=1)
-            loss_map = - (targets * log_probs)
-            if self.weights is not None:
-                w_broadcast = self.weights.view(1, -1, 1, 1)
-                loss_map = loss_map * w_broadcast
-            loss = loss_map.sum(dim=1).mean() 
-            return loss
-
-    criterion = MultinomialCrossEntropyLoss(weights=weights)
-
-    # 5. Optimizer & Scheduler
-    optimizer = optim.Adam(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    model = ColorizationLightningModule(
+        lr=cfg.model.lr,
+        weight_decay=cfg.model.weight_decay,
+        class_weights_path=cw_path
     )
-    
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', patience=2, factor=0.5
+
+    # 4. Callbacks
+    checkpoint_callback = ModelCheckpoint(
+        monitor='val_loss',
+        dirpath='checkpoints',
+        filename='colorization-{epoch:02d}-{val_loss:.2f}',
+        save_top_k=3,
+        mode='min',
     )
-    
-    scaler = torch.amp.GradScaler("cuda") if USE_AMP and DEVICE == "cuda" else None
+    lr_monitor = LearningRateMonitor(logging_interval='step')
 
-    # Resuming
-    start_epoch = 1
-    best_val_loss = float('inf') 
-    
-    if RESUME_FROM and os.path.isfile(RESUME_FROM):
-        print(f"Resuming from: {RESUME_FROM}")
-        ckpt = torch.load(RESUME_FROM, map_location=DEVICE)
-        model.load_state_dict(ckpt["state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        if scaler and "scaler" in ckpt: scaler.load_state_dict(ckpt["scaler"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_val_loss = ckpt.get("best_val_loss", float('inf'))
+    # 5. Trainer
+    trainer = pl.Trainer(
+        max_epochs=cfg.trainer.max_epochs,
+        accelerator=cfg.trainer.accelerator,
+        devices=cfg.trainer.devices,
+        precision=cfg.trainer.precision,
+        callbacks=[checkpoint_callback, lr_monitor],
+        log_every_n_steps=cfg.trainer.log_every_n_steps
+    )
 
-    # 6. Training loop
-    for epoch in range(start_epoch, NUM_EPOCHS + 1):
-        # Training
-        model.train()
-        train_loss_meter = AverageMeter()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [Train]")
-
-        for L, targets in pbar:
-            L = L.to(DEVICE, non_blocking=True)
-            targets = targets.to(DEVICE, non_blocking=True)
-
-            # Upsample on GPU
-            # Model outputs 112x112. Targets should be 112x112.
-            if targets.shape[-1] != 112:
-                targets = F.interpolate(targets, size=(112, 112), mode='nearest')
-
-
-            optimizer.zero_grad(set_to_none=True)
-
-            if scaler:
-                with torch.amp.autocast("cuda"):
-                    logits = model(L)
-                    loss = criterion(logits, targets)
-
-                if torch.isnan(loss):
-                    print("NaN detected. Skipping batch.")
-                    continue
-
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                logits = model(L)
-                loss = criterion(logits, targets)
-                if torch.isnan(loss): continue
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-            train_loss_meter.update(loss.item(), L.size(0))
-            pbar.set_postfix(loss=train_loss_meter.avg)
-
-        # Validation
-        print(f"Validating epoch {epoch}...")
-        val_loss = validate(model, val_loader, criterion)
-        
-        # Scheduler step
-        scheduler.step(val_loss)
-
-        print(
-            f"Epoch {epoch} Done. "
-            f"Train Loss: {train_loss_meter.avg:.4f} | "
-            f"Val Loss: {val_loss:.4f}"
-        )
-
-        # Save checkpoint
-        is_best = val_loss < best_val_loss
-        if is_best:
-            best_val_loss = val_loss
-            print(f"New best model! Loss: {best_val_loss:.4f}")
-
-        save_dict = {
-            "epoch": epoch,
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict() if scaler else None,
-            "loss": train_loss_meter.avg,
-            "val_loss": val_loss,
-            "best_val_loss": best_val_loss
-        }
-        
-        torch.save(save_dict, os.path.join(CHECKPOINTS_DIR, f"checkpoint_last.pth.tar"))
-        
-        if is_best:
-            torch.save(save_dict, os.path.join(CHECKPOINTS_DIR, f"checkpoint_best.pth.tar"))
+    # 6. Train
+    trainer.fit(model, train_loader, val_loader)
 
 if __name__ == "__main__":
-    train()
+    main()

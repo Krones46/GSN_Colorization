@@ -12,6 +12,7 @@ from io import BytesIO
 from PIL import Image
 from tqdm import tqdm
 from collections import defaultdict
+import argparse
 
 """
 Generates an advanced HTML report for colorization performance grouped by semantic categories.
@@ -33,7 +34,7 @@ CLASS_INDEX_JSON = os.path.join(BASE_DIR, "imagenet_class_index.json")
 OUTPUT_HTML = "enhanced_report.html"
 SAMPLES_PER_GROUP = 15
 TEMP = T_ANNEAL
-MODEL_NAME = "checkpoint_last_13_12.pth.tar" 
+MODEL_NAME = "colorization-epoch=08-val_loss=3.61.ckpt" 
 
 def img_to_base64(img_rgb, quality=70):
     """Image to base64 conversion for HTML."""
@@ -279,6 +280,10 @@ def generate_html(stats_by_group, detailed_results):
     print(f"\n[OK] Report generated: {os.path.abspath(OUTPUT_HTML)}")
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate Colorization Report")
+    parser.add_argument("--checkpoint", type=str, help="Path to checkpoint file")
+    args = parser.parse_args()
+
     if not os.path.exists(GROUPS_JSON):
         print(f"Missing JSON file: {GROUPS_JSON}. Run scripts/create_class_groups.py first!")
         return
@@ -333,23 +338,41 @@ def main():
         return
 
     # Load Model
-    ckpt_path = os.path.join(CHECKPOINTS_DIR, MODEL_NAME)
+    if args.checkpoint:
+        ckpt_path = args.checkpoint
+    else:
+        ckpt_path = os.path.join(CHECKPOINTS_DIR, MODEL_NAME)
     
-    if not os.path.exists(ckpt_path):
-        print(f"{MODEL_NAME} not found, looking for last one")
-        ckpts = [os.path.join(CHECKPOINTS_DIR, f) for f in os.listdir(CHECKPOINTS_DIR) if f.endswith(".pth.tar")]
-        if ckpts:
-            ckpts.sort(key=os.path.getmtime)
-            ckpt_path = ckpts[-1]
+        if not os.path.exists(ckpt_path):
+            print(f"{MODEL_NAME} not found, looking for last one")
+            ckpts = [os.path.join(CHECKPOINTS_DIR, f) for f in os.listdir(CHECKPOINTS_DIR) if f.endswith(".pth.tar") or f.endswith(".ckpt")]
+            if ckpts:
+                ckpts.sort(key=os.path.getmtime)
+                ckpt_path = ckpts[-1]
             
     if not ckpt_path or not os.path.exists(ckpt_path):
-         print("No checkpoint")
+         print(f"No checkpoint found at {ckpt_path}")
          return
     
     print(f"Loading model: {ckpt_path}")
     model = ColorizationModel(num_classes=NUM_COLOR_CLASSES).to(DEVICE)
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
-    model.load_state_dict(ckpt["state_dict"])
+    
+    # Handle Lightning Checkpoints (state_dict nested + 'model.' prefix)
+    state_dict = ckpt.get("state_dict", ckpt)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("model."):
+            new_state_dict[k[6:]] = v # Remove 'model.' prefix
+        else:
+            new_state_dict[k] = v
+            
+    try:
+        model.load_state_dict(new_state_dict)
+    except Exception as e:
+        print(f"Standard load failed, trying strict=False: {e}")
+        model.load_state_dict(new_state_dict, strict=False)
+        
     model.eval()
 
     # Analysis
