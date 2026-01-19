@@ -54,7 +54,6 @@ wandb/
 
 # User ignored
 test_images/
-scripts/evaluate_folder.py
 scripts/evaluate_metrics.py
 scripts/generate_group_report.py
 enhanced_report.html
