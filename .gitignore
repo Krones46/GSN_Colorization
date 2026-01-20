@@ -42,6 +42,7 @@ debug_overfit_result_v3.png
 visual_comparison.png
 tests_result.xlsx
 final_metrics.json
+analysis_*.png
 
 # Mac OS
 .DS_Store
